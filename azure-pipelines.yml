@@ -1,0 +1,155 @@
+# azure-pipelines.yml
+#
+# On-demand HPE OneView hardware inventory report.
+#
+# Run this pipeline manually from the Azure DevOps UI ("Run pipeline" button).
+# Configure the following SECRET pipeline variables in the pipeline UI:
+#   ONEVIEW_USERNAME      (secret)
+#   ONEVIEW_PASSWORD      (secret)
+#   ONEVIEW_AUTH_DOMAIN   (optional, secret if it leaks org structure)
+#
+# Optional: a "Secure File" named "oneview-ca.pem" can be uploaded under
+# Pipelines > Library > Secure files to validate an enterprise CA.
+
+trigger: none           # manual / on-demand only
+pr: none
+
+parameters:
+  - name: oneviewUrl
+    displayName: "OneView appliance URL"
+    type: string
+    default: "https://oneview.example.com"
+
+  - name: outputFileName
+    displayName: "Output CSV filename (blank = auto-timestamped)"
+    type: string
+    default: ""
+
+  - name: verifyTls
+    displayName: "TLS verification mode"
+    type: string
+    default: "true"
+    values:
+      - "true"
+      - "false"     # insecure - lab only
+      - "ca-bundle" # use the Secure File 'oneview-ca.pem'
+
+  - name: enableRawJsonDump
+    displayName: "Publish raw per-server JSON (troubleshooting)"
+    type: boolean
+    default: false
+
+  - name: strictMode
+    displayName: "Strict mode (fail pipeline on any per-server failure)"
+    type: boolean
+    default: false
+
+  - name: pythonVersion
+    displayName: "Python version"
+    type: string
+    default: "3.11"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  - name: REPORT_DIR
+    value: "$(Build.ArtifactStagingDirectory)/oneview-report"
+  - name: RAW_JSON_DIR
+    value: "$(Build.ArtifactStagingDirectory)/oneview-raw-json"
+
+stages:
+  - stage: Report
+    displayName: "Generate HPE OneView Inventory Report"
+    jobs:
+      - job: GenerateReport
+        displayName: "Discover & export CSV"
+        timeoutInMinutes: 60
+
+        steps:
+          - checkout: self
+            displayName: "Checkout repo"
+
+          - task: UsePythonVersion@0
+            displayName: "Use Python ${{ parameters.pythonVersion }}"
+            inputs:
+              versionSpec: "${{ parameters.pythonVersion }}"
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+            displayName: "Install Python dependencies"
+
+          - ${{ if eq(parameters.verifyTls, 'ca-bundle') }}:
+              - task: DownloadSecureFile@1
+                name: caBundle
+                displayName: "Download enterprise CA bundle (Secure File: oneview-ca.pem)"
+                inputs:
+                  secureFile: "oneview-ca.pem"
+
+          - script: |
+              set -euo pipefail
+              mkdir -p "$(REPORT_DIR)"
+
+              EXTRA_ARGS=()
+
+              # TLS mode
+              case "${{ parameters.verifyTls }}" in
+                "true")
+                  EXTRA_ARGS+=("--verify-tls" "true")
+                  ;;
+                "false")
+                  EXTRA_ARGS+=("--verify-tls" "false")
+                  echo "##vso[task.logissue type=warning]TLS verification disabled. Lab use only."
+                  ;;
+                "ca-bundle")
+                  EXTRA_ARGS+=("--ca-bundle" "$(caBundle.secureFilePath)")
+                  ;;
+              esac
+
+              # Strict mode
+              if [ "${{ parameters.strictMode }}" = "True" ]; then
+                EXTRA_ARGS+=("--strict")
+              fi
+
+              # Raw JSON dump
+              if [ "${{ parameters.enableRawJsonDump }}" = "True" ]; then
+                mkdir -p "$(RAW_JSON_DIR)"
+                EXTRA_ARGS+=("--dump-raw-json-dir" "$(RAW_JSON_DIR)")
+              fi
+
+              # Output path
+              if [ -n "${{ parameters.outputFileName }}" ]; then
+                EXTRA_ARGS+=("--output-csv" "$(REPORT_DIR)/${{ parameters.outputFileName }}")
+              else
+                EXTRA_ARGS+=("--output-dir" "$(REPORT_DIR)")
+              fi
+
+              python oneview_hw_inventory_report.py \
+                --oneview-url "${{ parameters.oneviewUrl }}" \
+                --username "$ONEVIEW_USERNAME" \
+                --password-env ONEVIEW_PASSWORD \
+                --auth-domain "${ONEVIEW_AUTH_DOMAIN:-}" \
+                "${EXTRA_ARGS[@]}"
+            env:
+              ONEVIEW_USERNAME: $(ONEVIEW_USERNAME)
+              ONEVIEW_PASSWORD: $(ONEVIEW_PASSWORD)
+              ONEVIEW_AUTH_DOMAIN: $(ONEVIEW_AUTH_DOMAIN)
+            displayName: "Run OneView inventory script"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish CSV report artifact"
+            condition: always()
+            inputs:
+              targetPath: "$(REPORT_DIR)"
+              artifact: "oneview-hw-inventory-csv"
+              publishLocation: "pipeline"
+
+          - ${{ if eq(parameters.enableRawJsonDump, true) }}:
+              - task: PublishPipelineArtifact@1
+                displayName: "Publish raw JSON dump artifact"
+                condition: always()
+                inputs:
+                  targetPath: "$(RAW_JSON_DIR)"
+                  artifact: "oneview-hw-inventory-raw-json"
+                  publishLocation: "pipeline"
